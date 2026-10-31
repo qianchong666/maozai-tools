@@ -1,0 +1,15 @@
+{
+  "enable_ai": true,
+  "api_url": "http://127.0.0.1:18080/v1/chat/completions",
+  "api_key": "",
+  "model": "Qwen3.5-4B-UD-Q8_K_XL",
+  "timeout": 600,
+  "max_retries": 3,
+  "v5_long_block_chars": 40000,
+  "v5_dup_policy": "修订版",
+  "v5_batch": 20,
+  "v5_toc_gap": 2,
+  "mode": "chapter",
+  "v6_chunk_tokens": 30000,
+  "v6_keep_chapter_files": true
+}

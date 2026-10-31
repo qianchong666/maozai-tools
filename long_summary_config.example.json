@@ -1,0 +1,22 @@
+{
+  "api_url": "http://127.0.0.1:19093/v1/chat/completions",
+  "api_key": "",
+  "model": "qwen3.6-35b-a3b",
+  "timeout": 600,
+  "temp": 0.5,
+  "card_lo": 400,
+  "card_hi": 800,
+  "base_lo": 900,
+  "base_hi": 3200,
+  "settle_every": 10,
+  "ev_max": 12,
+  "material": 8,
+  "attempts": 3,
+  "style": "混合",
+  "quote_mode": "转述",
+  "cast_enable": true,
+  "cast_n": 6,
+  "cast_hz": 50,
+  "out_dir": "",
+  "rewrite": false
+}

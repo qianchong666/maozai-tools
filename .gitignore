@@ -1,0 +1,15 @@
+# 运行时配置：含本地路径与可能的密钥，不入库
+aichapter_config.json
+long_summary_config.json
+api_keys.json
+config.json
+
+# 产出与临时文件
+OUT/
+__pycache__/
+*.pyc
+*.log
+
+# 让读者知道你本地的书不要提交
+*.txt
+!requirements.txt
