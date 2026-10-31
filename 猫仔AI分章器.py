@@ -29,7 +29,7 @@ try:
 except Exception:
     requests = None
 
-APP_TITLE = "猫仔AI分章器 v1.1"
+APP_TITLE = "猫仔AI分章器 v1.2"
 CFG_FILE = "aichapter_config.json"
 DEFAULT_CFG = {
     "enable_ai": True,
@@ -45,6 +45,8 @@ DEFAULT_CFG = {
     "mode": "chapter",
     "v6_chunk_tokens": 30000,
     "v6_keep_chapter_files": True,
+    "v7_chunk_chars": 6000,
+    "v7_overlap_pct": 5,
     "last_out": "",
 }
 
@@ -52,6 +54,7 @@ MODE_NAMES = {
     "chapter": "分章（按章节切）",
     "volume": "分卷（按第N卷/部/篇/集 切）",
     "chunk": "分块（分章后按累计 token 合并成块）",
+    "size": "字数分块（跳过章节，按字数切，块间留重叠）",
 }
 
 def cfg_path():
@@ -73,14 +76,50 @@ def save_cfg(cfg):
     except Exception:
         pass
 
+TEXT_INFO = {"encoding": "", "bom": False, "eol": "LF", "zw": 0, "chars": 0}
+
+
+def _looks_garbled(t):
+    """解码成功 ≠ 解码正确：替换符、私用区、控制字符太多就是解错了。"""
+    if not t:
+        return True
+    head = t[:20000]
+    bad = sum(1 for ch in head
+              if ch == "\ufffd" or "\ue000" <= ch <= "\uf8ff"
+              or (ord(ch) < 32 and ch not in "\n\r\t"))
+    return bad > max(8, len(head) // 500)
+
+
 def read_text_any(file_path):
-    for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "shift_jis", "utf-16", "latin1"):
+    """读 txt：BOM / 编码 / 行尾 / 零宽字符一次处理干净，返回纯文本。
+
+    GBK 老书、UTF-16 导出、带 BOM 的记事本文件都能读；实在读不出才容错解码。
+    """
+    raw = open(file_path, "rb").read()
+    enc_used, text, bom = "", "", False
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5", "utf-16"):
         try:
-            with open(file_path, "r", encoding=enc) as f:
-                return f.read()
+            t = raw.decode(enc)
         except (UnicodeDecodeError, UnicodeError):
             continue
-    raise ValueError("无法用任何支持的编码读取文件")
+        if _looks_garbled(t):
+            continue
+        enc_used, text = enc, t
+        bom = enc == "utf-8-sig" or raw[:2] in (b"\xff\xfe", b"\xfe\xff")
+        break
+    if not text:
+        text = raw.decode("utf-8", "ignore")
+        enc_used = "utf-8(容错)"
+    zw = sum(text.count(ch) for ch in ("\ufeff", "\u200b", "\u200c", "\u200d",
+                                       "\u2060", "\u00ad"))
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060", "\u00ad"):
+        text = text.replace(ch, "")
+    eol = "CRLF" if "\r\n" in text else ("CR" if ("\r" in text and "\n" not in text) else "LF")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    TEXT_INFO.update({"encoding": enc_used, "bom": bom, "eol": eol, "zw": zw,
+                      "chars": len(text)})
+    return text
+
 
 def sanitize_filename(s):
     return "".join(c for c in str(s) if c.isalnum() or c in " _-").rstrip() or "untitled"
@@ -538,6 +577,14 @@ def run_pipeline(src, out_root, cfg, log=None, progress=None, cur=None, gate=Non
     os.makedirs(task, exist_ok=True)
     log("模式：" + MODE_NAMES.get(mode, mode))
     log("结果目录：" + task)
+    log(f"格式：编码 {TEXT_INFO.get('encoding')}｜行尾 {TEXT_INFO.get('eol')}｜"
+        f"BOM {'有' if TEXT_INFO.get('bom') else '无'}"
+        + (f"｜清理零宽字符 {TEXT_INFO.get('zw')} 个" if TEXT_INFO.get("zw") else ""))
+    if mode == "size":      # 不看章节标题，直接按字数切，连模型都不用问
+        return _mode_size({"lines": content.split("\n"), "heads": [], "content": content,
+                           "src": src, "base_name": base_name, "task": task, "cfg": cfg,
+                           "t0": t0, "log": log, "progress": progress, "cur": cur,
+                           "gate": gate, "judge_err": None})
 
     # ① 扫描（章节候选 + 卷候选一起进 heads，kind 决定用途）
     cur("扫描全书…")
@@ -907,6 +954,195 @@ def _mode_chunk(ctx):
             "msg": msg, "stats": {"chunks": files, "tokens": total_tok}}
 
 
+# ==================== 模式四：字数分块（不定章，按完整分句切，块间留重叠） ====================
+V7_STOP = "。！？!?…；;"
+# 折行并段只认「句末」：省略号/分号/冒号常是话没说完，不能当段落结束
+V7_PARA_END = "。！？!?」』”"
+V7_CLOSE = "」』”’）)】》\"'"
+
+
+def v7_paras(text):
+    """把硬换行（40 字一断）并回段落：只有「上一行已在句末」或「本行开头缩进/空行」
+    才当新段落，否则视为同一个句子的折行。"""
+    paras, buf = [], []
+    for ln in (text or "").split("\n"):
+        s = ln.strip()
+        if not s:
+            if buf:
+                paras.append("".join(buf))
+                buf = []
+            continue
+        tail = buf[-1].rstrip()[-1:] if buf else ""
+        starts_new = ln.startswith("\u3000\u3000") or ln.startswith("\t") or ln[:2] == "  "
+        para_end = tail in V7_PARA_END
+        if buf and (starts_new or para_end):
+            paras.append("".join(buf))
+            buf = [s]
+        else:
+            buf.append(s)
+    if buf:
+        paras.append("".join(buf))
+    return paras
+
+
+def v7_split_sentences(text):
+    """切成完整分句：句末标点连同紧跟的收尾引号/括号一起带走。
+
+    先把折行并回段落再切，绝不从句中间切；一句太长就整句带走，宁可超一点。
+    """
+    sents = []
+    for para in v7_paras(text):
+        buf, i, n = [], 0, len(para)
+        while i < n:
+            ch = para[i]
+            buf.append(ch)
+            i += 1
+            if ch in V7_STOP:
+                while i < n and (para[i] in V7_CLOSE or para[i] in V7_STOP):
+                    buf.append(para[i])
+                    i += 1
+                sents.append("".join(buf))
+                buf = []
+        if buf:
+            sents.append("".join(buf))
+        sents.append("\n")
+    return sents
+
+
+V7_TAIL_OK = V7_PARA_END + "…；;：:）)】》"
+
+
+def v7_ends_sentence(s):
+    """这一句收得住吗——句末标点、收尾引号、省略号、分号都算收住，只有半句不算。"""
+    t = (s or "").strip()
+    return bool(t) and t[-1] in V7_TAIL_OK
+
+
+def v7_group_by_chars(sents, limit=6000, overlap_pct=5):
+    """按字数打包：只在分句边界封块；块尾必须是完整句；下一块开头重复上一块末尾约 5%。"""
+    limit = max(200, int(limit or 6000))
+    ov_chars = int(limit * max(0, min(30, int(overlap_pct or 0))) / 100.0)
+    chars = [len(s) for s in sents]
+    prefix, acc = [0], 0
+    for n in chars:
+        acc += n
+        prefix.append(acc)
+    out, i, ci, over = [], 0, 1, 0
+    while i < len(sents):
+        acc2, j = 0, i
+        while j < len(sents):
+            if acc2 and acc2 + chars[j] > limit:
+                break
+            acc2 += chars[j]
+            j += 1
+            if acc2 >= limit:
+                break
+        # 收口：块尾停在半句上就往回收一个单元，让这半句跟着下一块走
+        while j - 1 > i and (prefix[j] - prefix[i]) > limit * 0.6:
+            k = j - 1
+            while k > i and not sents[k].strip():
+                k -= 1
+            if k <= i or v7_ends_sentence(sents[k]):
+                break
+            j = k
+        body = prefix[j] - prefix[i]
+        out.append({"i": ci, "a": i, "b": j, "chars": body, "start": prefix[i] + 1,
+                    "end": prefix[j], "sents": j - i, "over": over,
+                    "single_oversize": (j - i == 1 and body > limit)})
+        ci += 1
+        if j >= len(sents):
+            break
+        nxt, back = j, 0
+        while nxt - 1 > i and back < ov_chars:
+            nxt -= 1
+            back += chars[nxt]
+        over = back if nxt < j else 0
+        i = nxt if nxt < j else j
+    return out
+
+
+def _mode_size(ctx):
+    """按字数切块：给没有章节标题的文章用（长文总结器的输入就是它）。"""
+    c, content, task = ctx["cfg"], ctx["content"], ctx["task"]
+    log, progress, cur, gate = ctx["log"], ctx["progress"], ctx["cur"], ctx["gate"]
+    limit = max(200, int(c.get("v7_chunk_chars", 6000) or 6000))
+    ov = max(0, min(30, int(c.get("v7_overlap_pct", 5) or 0)))
+    sents = v7_split_sentences(content)
+    if len(sents) <= 1:
+        return {"stopped": True, "msg": "全文切不出分句：文件可能是空的或编码不对", "task": task}
+    log(f"分句完成：{len(sents):,} 句｜每块目标 {limit:,} 字｜块间重叠 {ov}%")
+    groups = v7_group_by_chars(sents, limit, ov)
+    log(f"打包完成：{len(content):,} 字 → {len(groups)} 块（只在分句边界切）")
+
+    w = max(5, len(str(len(content))))
+    files = []
+    for g in groups:
+        if not gate():
+            return {"stopped": True, "msg": f"已停止（已写出 {len(files)} 块）", "task": task}
+        body = "".join(sents[g["a"]:g["b"]])
+        name = f"chunk{g['i']:03d}_{g['start']:0{w}d}-{g['end']:0{w}d}"
+        fn = name + ".txt"
+        with open(os.path.join(task, fn), "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        files.append({"chunk": name, "file": fn, "no": g["i"],
+                      "char_from": g["start"], "char_to": g["end"],
+                      "chars": g["chars"], "sentences": g["sents"],
+                      "overlap_chars": g["over"],
+                      "first_line": body.strip().split("\n")[0][:40],
+                      "oversize": g["single_oversize"]})
+        progress(len(files), len(groups))
+        cur(fn[:30])
+        log(f"  {fn}（{g['chars']:,} 字 / {g['sents']} 句"
+            + (f"，与上一块重叠 {g['over']} 字" if g["over"] else "") + "）")
+
+    total = sum(f["chars"] for f in files)
+    uni = len(content)
+    over_n = len([f for f in files if f["overlap_chars"]])
+    big = [f for f in files if f["oversize"]]
+    json.dump({"mode": "size", "limit_chars": limit, "overlap_pct": ov,
+               "text_chars": uni, "chunk_count": len(files),
+               "overlap_chunks": over_n, "oversize_single": len(big),
+               "encoding": TEXT_INFO.get("encoding"), "eol": TEXT_INFO.get("eol"),
+               "chunks": files},
+              open(os.path.join(task, "chunks.json"), "w", encoding="utf-8"),
+              ensure_ascii=False, indent=1)
+
+    rep = [f"# {ctx['base_name']} 字数分块报告", "",
+           f"- 源文件：{os.path.basename(ctx['src'])}"
+           f"（{len(ctx['content']):,} 字 / {len(ctx['lines']):,} 行）",
+           f"- 模式：字数分块（不定章；按**完整分句**切，块间留 {ov}% 重叠）",
+           f"- 每块目标：**{limit:,} 字**　·　重叠量约 {int(limit * ov / 100)} 字/块",
+           f"- 结果：**{len(files)} 块**，正文合计 {total:,} 字"
+           f"（含重叠；去重后 {uni:,} 字）",
+           f"- 超限单句：{len(big)} 个（一句话就超过上限，只能整句独占一块）",
+           f"- 编码：{TEXT_INFO.get('encoding')}　行尾：{TEXT_INFO.get('eol')}"
+           f"　BOM：{'有' if TEXT_INFO.get('bom') else '无'}"
+           f"　零宽字符清理：{TEXT_INFO.get('zw', 0)}",
+           f"- 耗时：{round(time.time() - ctx['t0'], 1)} 秒", "",
+           "| 块文件 | 字数区间 | 字数 | 句数 | 与上一块重叠 | 备注 |",
+           "|---|---|---|---|---|---|"]
+    for f_ in files:
+        rng = f"{f_['char_from']:,}-{f_['char_to']:,}"
+        rep.append(f"| {f_['file']} | {rng} | {f_['chars']:,} | {f_['sentences']} | "
+                   f"{f_['overlap_chars'] or '-'} | {'超限单句' if f_['oversize'] else ''} |")
+    rep += ["", "> 每块都从分句边界开始/结束：上一块最后一句会作为下一块的开头重复一次，"
+                "长文总结器读起来上下文不会断。"]
+    open(os.path.join(task, "字数分块报告.md"), "w", encoding="utf-8").write("\n".join(rep))
+
+    progress(100, 100)
+    msg = (f"✅ 字数分块完成：{uni:,} 字 → {len(files)} 块\n"
+           f"每块目标 {limit:,} 字，块间重叠 {ov}%（约 {int(limit * ov / 100)} 字）\n"
+           f"只在分句处切；超限单句 {len(big)} 个\n\n"
+           f"结果目录：\n{task}\n\n（块文件在根目录，含 字数分块报告.md 与 chunks.json）")
+    if len(files) == 1:
+        msg = ("⚠ 只切出 1 块：每块字数设小一点，或者这本书其实有章节标题（改用分章/分块）。\n\n"
+               + msg)
+    return {"ok": True, "task": task, "mode": "size", "files": len(files),
+            "stat": (f"{len(files)} 块｜{uni:,} 字｜每块 {limit:,}｜重叠 {ov}%｜"
+                     f"{round(time.time() - ctx['t0'], 1)}s"),
+            "msg": msg, "stats": {"chunks": files}}
+
+
 # ==================== GUI ====================
 class ChapterSplitterApp:
     def __init__(self, root):
@@ -926,6 +1162,8 @@ class ChapterSplitterApp:
         self.toc_gap = tk.StringVar(value=str(self.cfg.get("v5_toc_gap", 2)))
         self.mode = tk.StringVar(value=self.cfg.get("mode", "chapter"))
         self.chunk_tokens = tk.StringVar(value=str(self.cfg.get("v6_chunk_tokens", 30000)))
+        self.chunk_chars = tk.StringVar(value=str(self.cfg.get("v7_chunk_chars", 6000)))
+        self.overlap_pct = tk.StringVar(value=str(self.cfg.get("v7_overlap_pct", 5)))
         self.tok_method_text = tk.StringVar(value="")
         self.progress = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="0 / 0")
@@ -985,13 +1223,20 @@ class ChapterSplitterApp:
         mrow = tk.Frame(f3)
         mrow.grid(row=0, column=0, columnspan=6, sticky="w")
         tk.Label(mrow, text="模式：").pack(side="left")
-        for val, lab in (("chapter", "分章"), ("volume", "分卷"), ("chunk", "分块（按token合并）")):
+        for val, lab in (("chapter", "分章"), ("volume", "分卷"), ("chunk", "分块（按token合并）"),
+                         ("size", "字数分块（无章节用）")):
             tk.Radiobutton(mrow, text=lab, variable=self.mode, value=val,
                            command=self._mode_changed).pack(side="left", padx=(0, 8))
         tk.Label(mrow, text="　目标块大小(token)：").pack(side="left")
         self.ent_chunk = tk.Entry(mrow, textvariable=self.chunk_tokens, width=9)
         self.ent_chunk.pack(side="left")
         tk.Label(mrow, textvariable=self.tok_method_text, fg="gray").pack(side="left", padx=8)
+        tk.Label(mrow, text="　每块字数：").pack(side="left")
+        self.ent_chars = tk.Entry(mrow, textvariable=self.chunk_chars, width=9)
+        self.ent_chars.pack(side="left")
+        tk.Label(mrow, text="重叠%：").pack(side="left")
+        self.ent_ov = tk.Entry(mrow, textvariable=self.overlap_pct, width=5)
+        self.ent_ov.pack(side="left")
         tk.Label(f3, text="超长块阈值(字符)").grid(row=1, column=0, sticky="e", pady=(6, 0))
         tk.Entry(f3, textvariable=self.long_chars, width=8).grid(row=1, column=1, sticky="w", pady=(6, 0))
         tk.Label(f3, text="每批候选数").grid(row=1, column=2, sticky="e", pady=(6, 0))
@@ -1031,9 +1276,12 @@ class ChapterSplitterApp:
         self.log_box.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
 
     def _mode_changed(self):
-        chunk = (self.mode.get() == "chunk")
+        mode = self.mode.get()
+        chunk, size = (mode == "chunk"), (mode == "size")
         try:
             self.ent_chunk.config(state="normal" if chunk else "disabled")
+            self.ent_chars.config(state="normal" if size else "disabled")
+            self.ent_ov.config(state="normal" if size else "disabled")
         except Exception:
             pass
         try:
@@ -1087,6 +1335,8 @@ class ChapterSplitterApp:
                 "mode": self.mode.get(),
                 "v6_chunk_tokens": int(float(self.chunk_tokens.get() or 30000)),
                 "v6_keep_chapter_files": bool(self.cfg.get("v6_keep_chapter_files", True)),
+                "v7_chunk_chars": int(float(self.chunk_chars.get() or 6000)),
+                "v7_overlap_pct": int(float(self.overlap_pct.get() or 0)),
                 "last_out": self.out.get().strip(),
             }
         except ValueError as e:
@@ -1100,6 +1350,11 @@ class ChapterSplitterApp:
             raise ValueError("每批候选数必须 >= 1")
         if c["mode"] == "chunk" and c["v6_chunk_tokens"] < 500:
             raise ValueError("分块模式的目标块大小必须 >= 500 token")
+        if c["mode"] == "size":
+            if c["v7_chunk_chars"] < 200:
+                raise ValueError("字数分块：每块字数必须 >= 200")
+            if not (0 <= c["v7_overlap_pct"] <= 30):
+                raise ValueError("字数分块：重叠比例要在 0–30% 之间")
         return c
 
     def save_all(self):

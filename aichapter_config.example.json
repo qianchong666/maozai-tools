@@ -11,5 +11,7 @@
   "v5_toc_gap": 2,
   "mode": "chapter",
   "v6_chunk_tokens": 30000,
-  "v6_keep_chapter_files": true
+  "v6_keep_chapter_files": true,
+  "v7_chunk_chars": 6000,
+  "v7_overlap_pct": 5
 }
