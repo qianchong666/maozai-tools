@@ -17,6 +17,7 @@
   "cast_enable": true,
   "cast_n": 6,
   "cast_hz": 50,
+  "narrator": "",
   "out_dir": "",
   "rewrite": false
 }
