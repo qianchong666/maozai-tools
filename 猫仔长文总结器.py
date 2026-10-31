@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-猫仔长文总结器 v1.5
-==================
+猫仔长文总结器 v1.5.1
+====================
 把「事件行 → 素材句 → 场景 → 文学短文」这套工作流做成独立程序：
   每章：① 事件行（时间/地点/人物/权重，可核验的事实骨架）
         ①.5 人称：程序判第一/第三人称；第一人称先定「我」是谁（叙述者.json，全书一次），
@@ -36,7 +36,7 @@ try:
 except Exception:
     requests = None
 
-APP_TITLE = "猫仔长文总结器 v1.5"
+APP_TITLE = "猫仔长文总结器 v1.5.1"
 CJK = re.compile(r"[\u4e00-\u9fff]")
 QUOTED = re.compile(r"[「“]([^」”]{2,40})[」”]")
 EV_LINE = re.compile(
@@ -1120,14 +1120,29 @@ class LongSummaryApp:
             raise RuntimeError("空回复")
         return content
 
+    @staticmethod
+    def _decode(raw):
+        """txt 常见三种编码：UTF-8（带不带 BOM）、GB18030/GBK、UTF-16。别直接判空。"""
+        for enc in ("utf-8-sig", "utf-8", "gb18030", "utf-16"):
+            try:
+                t = raw.decode(enc)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            # gb18030 几乎什么都能"解"出来，用生僻字比例反查误判
+            if enc == "gb18030" and sum(1 for ch in t[:5000] if ch in "锟斤拷") > 20:
+                continue
+            return t
+        return raw.decode("utf-8", "ignore")
+
     def _read(self, p):
         try:
-            return open(p, encoding="utf-8").read()
+            with open(p, "rb") as f:
+                return self._decode(f.read())
         except Exception:
             return ""
 
     def _load_chapters(self, src):
-        """目录 → 逐文件；txt → 按「第X章」切"""
+        """目录 → 逐文件；txt → 按「第X章」切；没有章标题就当整本一章（用文件名当标题）"""
         chs = []
         if os.path.isdir(src):
             for f in sorted(os.listdir(src)):
@@ -1142,19 +1157,23 @@ class LongSummaryApp:
                             "text": body})
             return chs
         body = self._read(src).replace("\r\n", "\n")
-        lines = body.split("\n")
+        stem = os.path.splitext(os.path.basename(src))[0] or "book"
         cur, name = [], None
-        for ln in lines:
+
+        def push():
+            if not cur:
+                return
+            nm = name or (f"{stem}_开篇" if not chs else f"{stem}_{len(chs) + 1:04d}")
+            chs.append({"name": nm, "title": (name or nm).strip(),
+                        "text": "\n".join(cur)})
+
+        for ln in body.split("\n"):
             if CH_HEAD.match(ln) and len(ln.strip()) <= 60:
-                if cur:
-                    chs.append({"name": name or f"chapter{len(chs)+1:04d}",
-                                "title": (name or "").strip(), "text": "\n".join(cur)})
+                push()
                 name, cur = ln.strip(), [ln]
             else:
                 cur.append(ln)
-        if cur:
-            chs.append({"name": name or f"chapter{len(chs)+1:04d}",
-                        "title": (name or "").strip(), "text": "\n".join(cur)})
+        push()
         return chs
 
     def _pick_material(self, text, k):
@@ -2152,7 +2171,11 @@ class LongSummaryApp:
         try:
             chs = self._load_chapters(src)
             if not chs:
-                self.ui(self._finish, False, "没有找到任何章节")
+                why = "没有找到任何章节"
+                if os.path.isfile(src) and not self._read(src).strip():
+                    why = ("读不出内容：文件是空的，或编码不是 UTF-8 / GBK / UTF-16"
+                           "（可先用记事本另存为 UTF-8 再试）")
+                self.ui(self._finish, False, why)
                 return
             out, resumed = self.make_task_dir(c["out_dir"], src)
             self.last_task_dir = out
@@ -2171,6 +2194,12 @@ class LongSummaryApp:
                               f"结算卡 {c['base_lo']}–{c['base_hi']} 字｜每 {c['settle_every']} 章结算"
                               f"｜台账已有 {len(ledger)} 条")
 
+            big = max((len(x["text"]) for x in chs), default=0)
+            if big > 15000:
+                self.ui(self.log, f"⚠ 最大一章 {big} 字：事件行上限 {c['ev_max']} 条装不下这么多内容，"
+                                  f"建议把「事件行上限」提到 {min(200, max(20, big // 300))}、"
+                                  f"「素材句数」提到 {min(90, max(8, big // 700))}；"
+                                  f"或者先切段/分块再跑")
             book_cjk = cjk_only("".join(x["text"] for x in chs))
             # 卡片文件名 = 源文件名（章节目录则是每个 txt 的文件名主干），重名自动加序号
             stems, used = [], set()
