@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-猫仔长文总结器 v1.4
+猫仔长文总结器 v1.5
 ==================
 把「事件行 → 素材句 → 场景 → 文学短文」这套工作流做成独立程序：
   每章：① 事件行（时间/地点/人物/权重，可核验的事实骨架）
+        ①.5 人称：程序判第一/第三人称；第一人称先定「我」是谁（叙述者.json，全书一次），
+             事件行的「我」一律映射成叙述者的名字，第三人称段落单独标出
         ② 素材句（程序从原文分箱摘的短句，带原文位置百分比，供化用细节与台词）
         ③ 场景（程序按地点把事件行聚成 3–6 场，避免短文写成逐条清单）
         ③.5 人物身份先行：先定性别/辈分/亲缘（吃原文证据＋台账＋人物关系册），
@@ -34,7 +36,7 @@ try:
 except Exception:
     requests = None
 
-APP_TITLE = "猫仔长文总结器 v1.4"
+APP_TITLE = "猫仔长文总结器 v1.5"
 CJK = re.compile(r"[\u4e00-\u9fff]")
 QUOTED = re.compile(r"[「“]([^」”]{2,40})[」”]")
 EV_LINE = re.compile(
@@ -97,6 +99,7 @@ SYS_PROSE = (
     "不要标题、不要小标题、不要任何标签，也不要写人物表（人物简介由程序另附）。\n"
     "12) 玩笑与情趣里的自称（继母笑着自称「女儿」、主人自称「爸爸」）只当床上的叫法，"
     "不许写成真实亲缘，也不许据此改动人物身份；身份一律照【人物身份】。\n"
+    "13) {narr}\n"
     "【材料用法】\n"
     "- 场景事件：本章事实骨架。只能用它的事实，不许新增人物、地点、因果。\n"
     "- 素材句：原文细节与台词；方括号里的百分比是它在原文中的位置，引用要放进对应位置的场面。\n"
@@ -119,6 +122,17 @@ SYS_CAST = (
     "6) 情趣、玩笑、角色扮演里的自称不算身份：床上叫「爸爸」「女儿」「哥哥」是角色的叫法，"
     "不是真亲缘；只认叙述句和原文的明确交代。前文关系册已经定下的身份，"
     "除非原文叙述明确改变，否则照旧。\n")
+
+# 叙事人称与「我」的归属：全书只判一次
+SYS_NARR = (
+    "你是小说资料员。读开头的正文，回答两件事：这段文字是什么叙事人称；若是第一人称，「我」是谁。\n"
+    "只输出三行，不要解释：\n"
+    "人称: 第一人称｜第三人称\n"
+    "叙述者: 原文里其他人物对「我」最常用的那个称呼（如「弟弟」「阿明」「大少爷」），2–4 字；"
+    "原文确实没人称呼他，就写「主角」\n"
+    "证据: 「从原文逐字抄的一句」\n"
+    "规则：①台词里的「我」不算，只看叙述句里做主语的那个人；②不许写原文没出现过的名字；\n"
+    "③不许把「我／我们」本身写成叙述者——那只是代词；④不要因为「我」提过某人就把他当叙述者。\n")
 
 # 五对互斥称谓：正文里出现相反的那个就算写反了
 SYS_BASE = (
@@ -170,6 +184,7 @@ DEFAULT_CFG = {
     "cast_enable": True,
     "cast_n": 6,
     "cast_hz": 50,
+    "narrator": "",
     "out_dir": "",
     "rewrite": False,
 }
@@ -294,7 +309,8 @@ def rel_support(name, words, text, win=30):
 NAME_HEAD = "一二三四五六七八九十两几众数多每各某"
 NAME_BAD = "人们者家属子女男"
 # 模型常拿这些词当「人物」占位，不能当人名去全书检索
-NAME_STOP = {"未明", "不明", "未知", "未详", "不详", "未定", "无名", "未记", "略", "无"}
+NAME_STOP = {"未明", "不明", "未知", "未详", "不详", "未定", "无名", "未记", "略", "无",
+             "我", "我们", "咱们", "咱", "俺", "本人", "自己", "主角", "叙述者", "笔者"}
 # 角色/关系词：不是人名，不许进人物表（模型爱把它们当人物）
 NAME_GENERIC = {"系统", "管家", "前妻", "后妈", "继母", "母亲", "父亲", "姐姐", "妹妹",
                 "哥哥", "弟弟", "儿子", "女儿", "丈夫", "妻子", "师父", "徒弟", "老爷",
@@ -381,6 +397,114 @@ def cjk_only(s):
 
 
 CAST_HEAD = "【本章重要人物】"
+
+
+# ==================== 叙事人称：「我」到底是谁 ====================
+# 第一人称书里，「我」是叙述者；但情趣台词里的「我」、玩笑里的自称不算。
+# 判据看口吻（我与心理动词密度），不能只看「有没有我」——交代背景的段落常不带我。
+NARR_WORDS = {"我", "我们", "咱们", "咱", "俺", "本人", "自己", "主角", "叙述者", "笔者"}
+PSYCH = ("想", "觉得", "心里", "暗自", "心想", "琢磨", "以为", "感到", "担心",
+         "记得", "明白", "反应过来", "寻思")
+
+
+def iter_paras(t):
+    """按空行或「　　」缩进切段：txt 多是 40 字硬换行，按行算段落会全错。"""
+    out, buf = [], []
+    for ln in (t or "").split("\n"):
+        s = ln.strip()
+        if not s:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            continue
+        if buf and (ln.startswith("\u3000\u3000") or ln.startswith("\t") or ln.startswith("  ")):
+            out.append("".join(buf))
+            buf = [s]
+        else:
+            buf.append(s)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def count_me(t):
+    """叙述用的「我」：台词里的不算（「我还在放寒假」是人物说话，不是叙述者动作）。"""
+    return sum(strip_dialog(t or "").count(w) for w in ("我", "咱", "俺"))
+
+
+def detect_pov(text):
+    """判一段正文的叙事人称，并挑出真正的第三人称段落。
+
+    first：我/每千字 ≥2；third：我稀薄且他/她为主；mixed：两者都有。
+    第三人称段落＝≥80 字、没有「我」、有心理动词、他/她 ≥2 —— 只是交代背景不算。
+    """
+    body = strip_dialog(text or "")
+    cj = max(1, n_hz(body))
+    me = count_me(body)
+    third = body.count("他") + body.count("她")
+    per1k = me * 1000.0 / cj
+    spans, pos, total = [], 0, max(1, len(text or ""))
+    for para in iter_paras(text):
+        pos += len(para)
+        body_p = strip_dialog(para)                 # 只看叙述：整段都是台词的不算第三人称段
+        if len(body_p) < 60 or count_me(body_p):
+            continue
+        if (body_p.count("他") + body_p.count("她")) < 2:
+            continue
+        if not any(w in body_p for w in PSYCH):
+            continue
+        spans.append((int(pos * 100 / total), body_p[:40]))
+    ratio = sum(len(s[1]) for s in spans) * 1.0 / total
+    if per1k >= 2.0:
+        verdict = "mixed" if ratio >= 0.12 else "first"
+    elif per1k >= 0.6:
+        verdict = "mixed"
+    else:
+        verdict = "third"
+    return {"verdict": verdict, "me": me, "third": third, "per1k": round(per1k, 2),
+            "spans": spans[:4], "span_ratio": round(ratio, 3)}
+
+
+def guess_narrator(text, topn=6):
+    """与「我」同段、且反复出现的称呼——只是给模型的候选，最后要模型+原文核验。
+
+    n-gram 会产出大量「出来／然后就」这类垃圾，用停用字 + 出现次数 + 跨段数过滤。
+    """
+    BADCH = set("的了是在和就不都也还很太更又没要有会能可这那你我他她它们个把被让给对从到"
+                "上下里外中说着过做去来想看得地儿吧呢啊呀么什怎样些点次天时后前年日月")
+    score, paras_of = {}, {}
+    for pi, para in enumerate(iter_paras(text or "")):
+        if not count_me(para):
+            continue
+        for nm in set(re.findall(r"[\u4e00-\u9fff]{2,3}", para)):
+            if nm in NARR_WORDS or nm in NAME_STOP or not is_person_name(nm):
+                continue
+            if any(c in BADCH for c in nm):
+                continue
+            score[nm] = score.get(nm, 0) + 1
+            paras_of.setdefault(nm, set()).add(pi)
+    keep = [(n, k) for n, k in score.items()
+            if (k >= 4 and len(n) == 2) or (k >= 3 and len(n) == 3)]
+    keep.sort(key=lambda kv: (-kv[1], -len(paras_of.get(kv[0], ()))))
+    return keep[:topn]
+
+
+def map_me(txt, name):
+    """把叙述里的「我／我们／咱／俺」换成叙述者的名字；引号里的台词一个字不动。"""
+    if not name or not txt:
+        return txt
+    chunks = re.split(r"(「[^」]*」|『[^』]*』|“[^”]*”)", txt)
+    for i, seg in enumerate(chunks):
+        if seg.startswith(("「", "『", "“")):
+            continue
+        chunks[i] = (seg.replace("我们", name).replace("咱们", name)
+                     .replace("咱", name).replace("俺", name).replace("我", name))
+    return "".join(chunks)
+
+
+def rows_text(rows):
+    """把事件行渲染回文本：落盘用这个版本（「我」已换成叙述者的名字）。"""
+    return "\n".join(f"{r['idx']}: ({r['ctx']}) {r['desc']} ({r['w']:.2f})" for r in rows)
 
 
 def split_card(txt):
@@ -629,6 +753,7 @@ class LongSummaryApp:
         self.cast_enable = tk.BooleanVar(value=bool(self.cfg.get("cast_enable", True)))
         self.cast_n = tk.StringVar(value=str(self.cfg.get("cast_n", 6)))
         self.cast_hz = tk.StringVar(value=str(self.cfg.get("cast_hz", 50)))
+        self.narrator = tk.StringVar(value=str(self.cfg.get("narrator", "")))
 
         self.progress = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="0 / 0")
@@ -651,7 +776,7 @@ class LongSummaryApp:
     # ============================== 界面 ==============================
     def _build_ui(self):
         root = self.root
-        root.geometry("900x760")
+        root.geometry("920x790")
         root.grid_columnconfigure(0, weight=1)
         root.grid_rowconfigure(3, weight=1)
 
@@ -730,6 +855,11 @@ class LongSummaryApp:
         tk.Entry(f3, textvariable=self.cast_n, width=6).grid(row=4, column=5, sticky="w", pady=(4, 0))
         tk.Label(f3, text="人（1–50，含社会关系；老卡缺这块会自动补，不重写正文）",
                  fg="gray").grid(row=4, column=6, columnspan=2, sticky="w", pady=(4, 0))
+
+        tk.Label(f3, text="叙述者").grid(row=5, column=0, sticky="e", padx=(6, 2), pady=(4, 0))
+        tk.Entry(f3, textvariable=self.narrator, width=10).grid(row=5, column=1, sticky="w", pady=(4, 0))
+        tk.Label(f3, text="第一人称书里的「我」＝谁；留空＝自动识别（每本书只判一次，存 叙述者.json）",
+                 fg="gray").grid(row=5, column=2, columnspan=6, sticky="w", pady=(4, 0))
 
         # ---- 控制 + 进度 ----
         f4 = tk.LabelFrame(root, text="④ 运行", padx=8, pady=6)
@@ -821,6 +951,7 @@ class LongSummaryApp:
                 "cast_enable": bool(self.cast_enable.get()),
                 "cast_n": int(float(self.cast_n.get() or 6)),
                 "cast_hz": int(float(self.cast_hz.get() or 50)),
+                "narrator": self.narrator.get().strip(),
                 "out_dir": self.out_dir.get().strip(),
                 "rewrite": bool(self.rewrite.get()),
             }
@@ -1065,9 +1196,109 @@ class LongSummaryApp:
                 bad += 1
         return rows, bad
 
-    def _check_events(self, txt, book_cjk, ev_max):
+    # ---------------------- 叙述者：全书只判一次 ----------------------
+    def _narr_path(self, task):
+        return os.path.join(task, "叙述者.json")
+
+    def _load_narr(self, task):
+        try:
+            with open(self._narr_path(task), encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_narr(self, task, d):
+        try:
+            with open(self._narr_path(task), "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.ui(self.log, f"  叙述者.json 写失败：{e}")
+
+    def _identify_narrator(self, c, task, chs, manual=""):
+        """判定「我」是谁。manual 有值就直接用；否则只在全书开头问一次模型并落盘。"""
+        d = self._load_narr(task)
+        manual = (manual or "").strip()
+        if manual:
+            if d.get("name") != manual or d.get("source") != "manual":
+                d = {"mode": "first", "name": manual, "source": "manual"}
+                self._save_narr(task, d)
+            return d
+        if d.get("name") or d.get("mode"):
+            return d
+        head = (chs[0]["text"] if chs else "")[:2500]
+        pov = detect_pov(head)
+        if pov["verdict"] == "third":
+            d = {"mode": "third", "name": "", "source": "auto"}
+            self._save_narr(task, d)
+            return d
+        cands = [n for n, k in guess_narrator(head) if k >= 3][:6]
+        user = f"【开头正文】\n{head}"
+        if cands:
+            user += f"\n\n【与「我」同段出现最多的人名（仅供参考，可能不对）】\n{'、'.join(cands)}"
+        name, ev = "", ""
+        for _ in range(max(1, min(2, int(c.get("attempts", 3))))):
+            if not self._gate():
+                break
+            try:
+                t = self._call(c, [{"role": "system", "content": SYS_NARR},
+                                   {"role": "user", "content": user}], 160)
+                self.ui(self.log, "  " + " / ".join(
+                    x.strip() for x in (t or "").split("\n") if x.strip())[:80])
+            except Exception as e:
+                self.ui(self.log, f"  叙述者识别失败：{type(e).__name__}: {e}")
+                time.sleep(1.5)
+                continue
+            mm = re.search(r"人称\s*[:：]\s*([^\n]+)", t or "")
+            mn = re.search(r"叙述者\s*[:：]\s*([^\n]{1,12})", t or "")
+            me_ = re.search(r"证据\s*[:：]\s*([^\n]+)", t or "")
+            if mm and "第三" in mm.group(1) and "第一" not in mm.group(1):
+                d = {"mode": "third", "name": "", "source": "auto"}
+                self._save_narr(task, d)
+                return d
+            if mn:
+                nm = re.sub(r"[「」『』“”\"'，。；：、\s]", "", mn.group(1))
+                nm = re.sub(r"^(是|叫|名为|本名)", "", nm)
+                if nm in NARR_WORDS or nm in ("无名", "未知", "不明"):
+                    nm = ""
+                if nm and 1 < len(nm) <= 4 and cjk_only(nm):
+                    name, ev = nm, (me_.group(1) if me_ else "")
+                break
+        if name and name not in cjk_only(head):
+            self.ui(self.log, f"  叙述者「{name}」在开头没出现，改用占位名")
+            name = ""
+        if not name:
+            name = "主角"
+            self.ui(self.log, "  ⚠ 原文没给叙述者名字/称呼，暂用「主角」；"
+                              "界面「叙述者」填对后重跑，卡片会用这个名字")
+        d = {"mode": "first", "name": name, "evidence": ev, "source": "auto"}
+        self._save_narr(task, d)
+        return d
+
+    def _check_events(self, txt, book_cjk, ev_max, narrator=""):
         rows, bad = self._parse_events(txt)
         hard, soft = [], []
+        # 「我」不是人名：人物栏里的代词换成叙述者，描述里的「我」也换成名字（台词不动）
+        me_left = 0
+        for r in rows:
+            m = re.search(r"人物\s*[:：]\s*([^|｜)）]+)", r["ctx"])
+            if m:
+                toks = [p.strip() for p in re.split(r"[,，、;；/\s]+", m.group(1)) if p.strip()]
+                new = []
+                for p in toks:
+                    if p in NARR_WORDS:
+                        if not narrator:
+                            me_left += 1
+                            continue
+                        p = narrator
+                    if p and p not in new:
+                        new.append(p)
+                if new != toks:
+                    r["ctx"] = r["ctx"][:m.start(1)] + ",".join(new) + r["ctx"][m.end(1):]
+            if narrator:
+                r["desc"] = map_me(r["desc"], narrator)
+        if me_left:
+            hard.append("「我」被当成人名（第一人称要用叙述者的名字）")
+
         if bad >= 3:
             hard.append(f"{bad} 行格式不合格")
         elif bad:
@@ -1099,11 +1330,16 @@ class LongSummaryApp:
         return rows, hard, soft
 
     def _check_prose(self, txt, material, c, chapter_text="", offnames=(),
-                     prev_names=(), must=(), rel_map=None, rel_trip=None):
+                     prev_names=(), must=(), rel_map=None, rel_trip=None, narrator=""):
         hard, soft = [], []
         hz = n_hz(txt)
         if not (c["card_lo"] <= hz <= c["card_hi"]):
             soft.append(f"{hz} 字（要求 {c['card_lo']}–{c['card_hi']}）")
+        # 统一第三人称：正文里不该出现叙述用的「我」（引号台词里的我照旧放行）
+        if narrator:
+            me = count_me(txt)
+            if me:
+                soft.append(f"正文出现「我」{me} 处（应写叙述者 {narrator}）")
         used = QUOTED.findall(txt)
         # 引文只在「原文全章」里核验：模型引的真句子不必来自素材句，但绝不能无中生有
         src = cjk_only(chapter_text) if chapter_text else cjk_only("".join(q for _, q in material))
@@ -1463,7 +1699,7 @@ class LongSummaryApp:
                 led_names.add(v["name"])
         return ev_names, led_names
 
-    def _make_cast(self, c, title, ledger, rows, prev_cast="", ch_text=""):
+    def _make_cast(self, c, title, ledger, rows, prev_cast="", ch_text="", narrator=""):
         """一章的「重要人物简介」：一人一句，≤cast_hz 汉字，必须带社会关系。"""
         if not c.get("cast_enable", True) or not rows:
             return []
@@ -1471,7 +1707,7 @@ class LongSummaryApp:
         maxn = int(c.get("cast_n", 6))
         ev_names, led_names = self._cast_people(rows, ledger)
         # 人名候选：事件行点到的 + 台账里、本章原文确实出现的（防止漏掉没写进事件行的配角）
-        cand = [n for n in sorted(ev_names) if is_person_name(n)]
+        cand = [n for n in sorted(ev_names) if is_person_name(n) or n == narrator]
         if ch_text:
             ct = cjk_only(ch_text)
             extra = [v["name"] for v in (ledger or {}).values()
@@ -1479,9 +1715,15 @@ class LongSummaryApp:
                      and v["name"] in ct and v["name"] not in cand
                      and is_person_name(v["name"])]
             cand += extra
+        if narrator and narrator not in cand:
+            cand.insert(0, narrator)
         evs = "\n".join(f"{r['idx']}: {r['desc']}（权重 {r['w']:.2f}）"
                         for r in rows[:max(60, 3 * maxn)])
         user = f"【本章】{title}\n\n【事件行（权重）】\n{evs}"
+        if narrator:
+            user += (f"\n\n【叙述者】本章是第一人称叙述，原文的「我」＝{narrator}。"
+                     f"{narrator} 是本书叙述者，必须排在人物表第一行，"
+                     f"身份里写明「本书叙述者」。")
         if cand:
             user += f"\n\n【人名候选（本章出场的有名字的人，逐个都要写一行）】\n{'、'.join(cand[:60])}"
             ev_txt = relation_evidence(cand[:20], ch_text)
@@ -1506,7 +1748,7 @@ class LongSummaryApp:
                 time.sleep(1.5)
                 continue
             rr = [(n, d) for n, d in parse_cast(t, hz, maxn)
-                  if is_person_name(n)]
+                  if is_person_name(n) or n == narrator]
             if rr:
                 return rr[:maxn]
         return []
@@ -1627,7 +1869,7 @@ class LongSummaryApp:
         return rel
 
     # ---------------------------- 身份体检 / 纠正（正文前必须过） ----------------------------
-    def _audit_identity(self, id_rows, rel, ch_text):
+    def _audit_identity(self, id_rows, rel, ch_text, narrator=""):
         """身份体检：性别有没有、亲缘有没有、名字本章真出现吗、和关系册冲突吗。"""
         issues, ch = [], cjk_only(ch_text)
         for name, text in id_rows or ():
@@ -1638,7 +1880,7 @@ class LongSummaryApp:
                        or re.search(r"[\u4e00-\u9fff]{2,4}[之的][\u4e00-\u9fff]{1,5}", head))
             if not has_rel:
                 issues.append((name, "缺亲缘/身份"))
-            if ch and name not in ch:
+            if ch and name not in ch and name != narrator:
                 issues.append((name, "本章原文没出现"))
             old = set((rel.get(name) or {}).get("claims") or ())
             bad = rel_conflict(old, declared_rels([(name, text)]).get(name) or set())
@@ -1646,9 +1888,10 @@ class LongSummaryApp:
                 issues.append((name, "与关系册冲突：" + "、".join(bad)))
         return issues
 
-    def _repair_identity(self, id_rows, rel, ch_text, issues):
+    def _repair_identity(self, id_rows, rel, ch_text, issues, narrator=""):
         """按体检结果纠正：缺性别/缺身份→从关系册补；本章没出现的→删掉；冲突→用关系册覆盖。"""
-        drop_names = {n for n, why in issues if why == "本章原文没出现"}
+        drop_names = {n for n, why in issues
+                      if why == "本章原文没出现" and n != narrator}
         out = []
         for name, text in id_rows or ():
             if name in drop_names:
@@ -1940,6 +2183,22 @@ class LongSummaryApp:
                 stems.append(base)
             self._stems = stems
 
+            # 「我」是谁：全书只判一次（叙述者.json），卡片统一第三人称
+            narr = self._identify_narrator(c, out, chs, c.get("narrator", ""))
+            nname = (narr.get("name") or "").strip()
+            if nname:
+                self.ui(self.log, f"叙述者：「我」＝{nname}"
+                                  f"（{'手填' if narr.get('source') == 'manual' else '自动识别'}）"
+                                  f"｜卡片统一第三人称")
+            else:
+                self.ui(self.log, "叙事人称：第三人称（本书没有第一人称叙述者）")
+
+            def pov_head(pov):
+                lab = {"first": "第一人称", "mixed": "第一/第三混合", "third": "第三人称"}
+                return (f"人称 {lab.get(pov['verdict'], pov['verdict'])}"
+                        f"（我 {pov['me']} 次、{pov['per1k']}/千字"
+                        + (f"，第三人称段 {len(pov['spans'])} 处" if pov["spans"] else "") + "）")
+
             def cpath(no, ext=".md"):
                 return os.path.join(out, "cards", stems[no - 1] + ext)
 
@@ -1955,6 +2214,7 @@ class LongSummaryApp:
 
             done = 0
             warn = 0
+            warned_narr = False
             t0 = time.time()
 
             for i, ch in enumerate(chs, 1):
@@ -1962,6 +2222,13 @@ class LongSummaryApp:
                     self.ui(self._finish, False, f"已停止：完成 {done}/{total} 章，下次从第 {i} 章继续")
                     return
                 no = i
+                pov = detect_pov(ch["text"])
+                # 整章第三人称时不把「我」映射成叙述者（那章的我可能根本不存在）
+                narr_ch = "" if pov["verdict"] == "third" else nname
+                if not nname and not warned_narr and pov["verdict"] != "third":
+                    warned_narr = True
+                    self.ui(self.log, "  ⚠ 本章是第一人称，但全书没识别出叙述者：卡片可能混用「我」；"
+                                      "界面「叙述者」填名字后重跑")
                 card_p = legacy(no)
                 ev_p = legacy(no, ".events.md")
 
@@ -1980,7 +2247,7 @@ class LongSummaryApp:
                                 :max(800, 60 * int(c.get("cast_n", 6)))]
                             cr = self._make_cast(c, ch["title"], ledger,
                                                  self._clamp_rows(r0, c["ev_max"])[0],
-                                                 hint, ch_text=ch["text"])
+                                                 hint, ch_text=ch["text"], narrator=narr_ch)
                             if cr:
                                 cr, rel0, notes0 = self._fix_identity(cr, rel0, ch["text"], no)
                                 rel0 = self._store_identity(rel0, cr, no)
@@ -2022,9 +2289,20 @@ class LongSummaryApp:
                 fg = "\n".join(fg_parts)
 
                 self.ui(self.cur_chapter.set, f"{ch['title'][:24]}（{i}/{total}）")
-                self.ui(self.log, f"第 {no} 章 {ch['title'][:24]}｜前文 {n_hz(fg)} 字")
+                self.ui(self.log, f"第 {no} 章 {ch['title'][:24]}｜前文 {n_hz(fg)} 字"
+                                  + (f"｜{pov_head(pov)}" if nname or pov["verdict"] != "third" else ""))
 
                 # ① 事件行（只看本章正文：抽取器不该被前文污染）
+                ev_user = f"【本章正文】\n{ch['title']}\n{ch['text']}"
+                if narr_ch:
+                    tip = (f"【叙事人称】第一人称：「我」＝{narr_ch}。\n"
+                           f"1) 人物栏一律写名字，绝不许出现「我／我们／咱／俺」——「我」做的事记在"
+                           f"{narr_ch} 名下；\n"
+                           f"2) 描述里也把「我」写成{narr_ch}（引号里的台词照抄，不改）。\n")
+                    if pov["spans"]:
+                        tip += ("【本章的第三人称段落（主语是别人，不是" + narr_ch + "）】\n"
+                                + "\n".join(f"- [{p}%] {s}" for p, s in pov["spans"]) + "\n")
+                    ev_user = tip + ev_user
                 ev, rows = None, None
                 for a in range(c["attempts"]):
                     if not self._gate():
@@ -2033,13 +2311,13 @@ class LongSummaryApp:
                     try:
                         t = self._call(c, [
                             {"role": "system", "content": SYS_EVENTS.format(n=c["ev_max"])},
-                            {"role": "user", "content": f"【本章正文】\n{ch['title']}\n{ch['text']}"}],
+                            {"role": "user", "content": ev_user}],
                             1200 + 60 * c["ev_max"])
                     except Exception as e:
                         self.ui(self.log, f"  事件行请求失败：{type(e).__name__}: {e}")
                         time.sleep(2)
                         continue
-                    r, hard, soft = self._check_events(t, book_cjk, c["ev_max"])
+                    r, hard, soft = self._check_events(t, book_cjk, c["ev_max"], narrator=narr_ch)
                     self.ui(self.log, f"  事件行 试{a+1}: {len(r)} 条 {n_hz(t)} 字 "
                                       + ("✓" if not hard else "✗ " + str(hard)[:60]))
                     if not hard:
@@ -2102,21 +2380,21 @@ class LongSummaryApp:
                             prev_cast2 = "\n".join(keep_lines)[
                                 :max(800, 60 * int(c.get("cast_n", 6)))]
                     id_rows = self._make_cast(c, ch["title"], ledger, kept, prev_cast2,
-                                              ch_text=ch["text"])
+                                              ch_text=ch["text"], narrator=narr_ch)
                     if id_rows:
                         # 先查（吃关系册+原文证据）→ 写 → 验 → 错就纠 → 再验，通过了才写正文
                         for rnd in range(3):
                             id_rows, rel, notes = self._fix_identity(id_rows, rel, ch["text"], no)
                             for nt in notes:
                                 self.ui(self.log, f"  ⚖ {nt}")
-                            issues = self._audit_identity(id_rows, rel, ch["text"])
+                            issues = self._audit_identity(id_rows, rel, ch["text"], narrator=narr_ch)
                             if not issues:
                                 if rnd:
                                     self.ui(self.log, f"  ⚖ 身份核验通过（第 {rnd + 1} 轮）")
                                 break
                             self.ui(self.log, "  ⚖ 身份待纠："
                                      + "；".join(f"{n}·{w}" for n, w in issues[:4]))
-                            id_rows = self._repair_identity(id_rows, rel, ch["text"], issues)
+                            id_rows = self._repair_identity(id_rows, rel, ch["text"], issues, narrator=narr_ch)
                         rel = self._store_identity(rel, id_rows, no)
                         self._save_rel(out, rel)
                         self.ui(self.log, f"  人物身份 {len(id_rows)} 人：" +
@@ -2139,7 +2417,12 @@ class LongSummaryApp:
                     style=STYLE_RULES.get(c["style"], STYLE_RULES["混合"]),
                     quotes=QUOTE_RULES.get(c.get("quote_mode", "转述"), QUOTE_RULES["转述"]),
                     lo=c["card_lo"], hi=c["card_hi"],
-                    mid=(c["card_lo"] + c["card_hi"]) // 2)
+                    mid=(c["card_lo"] + c["card_hi"]) // 2,
+                    narr=(f"本书是第一人称叙述，原文的「我」＝{narr_ch}。全篇必须第三人称："
+                          f"用「{narr_ch}」作主语，绝不许出现「我／我们／咱」（引号台词里可以有）；"
+                          f"标了第三人称的段落，主语是别人，别把那些动作记到{narr_ch}头上。"
+                          if narr_ch else
+                          "本书是第三人称；全篇按人物名字写，不要用「我」叙述。"))
                 best, best_score = None, 10 ** 9
                 for a in range(c["attempts"]):
                     if not self._gate():
@@ -2147,6 +2430,13 @@ class LongSummaryApp:
                         return
                     parts = [f"【本章】{ch['title']}", f"【场景事件】\n{scenes}",
                              f"【素材句】\n{qblock}"]
+                    if narr_ch:
+                        nb = (f"【叙述者】本章是第一人称，「我」＝{narr_ch}；正文用{narr_ch}作主语，"
+                              f"全篇第三人称。")
+                        if pov["spans"]:
+                            nb += ("\n【第三人称段落（主语不是" + narr_ch + "）】\n"
+                                   + "\n".join(f"- [{p}%] {s}" for p, s in pov["spans"]))
+                        parts.append(nb)
                     if prev_tail:
                         parts.append("【上一张卡的结尾】\n…" + prev_tail)
                     if id_block:
@@ -2170,7 +2460,7 @@ class LongSummaryApp:
                         continue
                     hard, soft, hz, nq = self._check_prose(t, material, c, ch["text"], offnames,
                                                            prev_names=prev_names, must=must,
-                                                           rel_map=rel_map, rel_trip=rel_trip)
+                                                           rel_map=rel_map, rel_trip=rel_trip, narrator=narr_ch)
                     self.ui(self.log, f"  短文 试{a+1}: {hz} 字 引文{nq} "
                                       + ("✓" if not hard and not soft else
                                          ("✗ " + str(hard)[:60] if hard else "⚠ " + str(soft)[:40])))
@@ -2195,7 +2485,7 @@ class LongSummaryApp:
                     if nfix:
                         h2, s2, hz2, nq2 = self._check_prose(t2, material, c, ch["text"], offnames,
                                                              prev_names=prev_names, must=must,
-                                                             rel_map=rel_map, rel_trip=rel_trip)
+                                                             rel_map=rel_map, rel_trip=rel_trip, narrator=narr_ch)
                         self.ui(self.log, f"  → 引语自动修复 {nfix} 处：" + ("✓" if not h2 else "仍有问题"))
                         if not h2:
                             txt = t2
@@ -2211,11 +2501,12 @@ class LongSummaryApp:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 open(dst, "w", encoding="utf-8").write(
                     card_text(os.path.splitext(os.path.basename(dst))[0], id_rows, txt))
-                open(ev_p, "w", encoding="utf-8").write(ev)
+                ev_saved = rows_text(rows) or ev
+                open(ev_p, "w", encoding="utf-8").write(ev_saved)
                 if hard_left:
                     self.ui(self.log, f"  → 存草稿（硬校验没过）：{os.path.relpath(dst, out)}")
                 # ⑤ 台账：人物 × 章节
-                self._fill_ledger(c, no, ch, ev, ledger, ledger_dir)
+                self._fill_ledger(c, no, ch, ev_saved, ledger, ledger_dir)
                 if best[2]:
                     warn += 1
                     json.dump({"issues": best[2], "汉字": best[1]},
